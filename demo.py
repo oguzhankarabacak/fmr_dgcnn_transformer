@@ -39,7 +39,7 @@ class Demo:
         self.max_iter = 10  # max iteration time for IC algorithm
         self._loss_type = 1  # see. self.compute_loss()
 
-    def create_model(self):
+    def create_model(self,args):
         # Encoder network: extract feature for every point. Nx1024
         ptnet = PointNet(dim_k=self.dim_k)
         # Decoder network: decode the feature into points, not used during the evaluation

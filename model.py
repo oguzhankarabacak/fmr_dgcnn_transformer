@@ -6,9 +6,114 @@ Date: 2020-06-19
 import torch
 import numpy as np
 from random import sample
-
+import torch.nn as nn
+import torch.nn.functional as F
+import modelv2
 import se_math.se3 as se3
 import se_math.invmat as invmat
+
+
+def knn(x, k):
+    inner = -2 * torch.matmul(x.transpose(2, 1), x)
+    xx = torch.sum(x ** 2, dim=1, keepdim=True)
+    pairwise_distance = -xx - inner - xx.transpose(2, 1)
+
+    idx = pairwise_distance.topk(k=k, dim=-1)[1]  # (batch_size, num_points, k)
+    return idx
+
+
+def get_graph_feature(x, k=20, idx=None):
+    batch_size = x.size(0)
+    num_points = x.size(2)
+    x = x.view(batch_size, -1, num_points)
+    if idx is None:
+        idx = knn(x, k=k)  # (batch_size, num_points, k)
+    device = torch.device('cuda')
+
+    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
+
+    idx = idx + idx_base
+
+    idx = idx.view(-1)
+
+    _, num_dims, _ = x.size()
+
+    x = x.transpose(2,
+                    1).contiguous()  # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
+    feature = x.view(batch_size * num_points, -1)[idx, :]
+    feature = feature.view(batch_size, num_points, k, num_dims)
+    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
+
+    feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()
+
+    return feature
+
+class DGCNN(nn.Module):
+    def __init__(self, emb_dims=512):
+        super(DGCNN, self).__init__()
+        self.conv1 = nn.Conv2d(6, 64, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv2d(64*2, 64, kernel_size=1, bias=False)
+        self.conv3 = nn.Conv2d(64*2, 128, kernel_size=1, bias=False)
+        self.conv4 = nn.Conv2d(128*2, 256, kernel_size=1, bias=False)
+        self.conv5 = nn.Conv2d(512, emb_dims, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.bn5 = nn.BatchNorm2d(emb_dims)
+        '''self.conv1 = nn.Conv2d(6, 64, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=1, bias=False)
+        self.conv5 = nn.Conv2d(512, emb_dims, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.bn5 = nn.BatchNorm2d(emb_dims)
+        '''
+    def forward(self, x):
+        '''
+                batch_size, num_points, num_dims = x.size()
+        x = get_graph_feature(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x1 = x.max(dim=-1, keepdim=True)[0]
+
+        x = F.relu(self.bn2(self.conv2(x)))
+        x2 = x.max(dim=-1, keepdim=True)[0]
+
+        x = F.relu(self.bn3(self.conv3(x)))
+        x3 = x.max(dim=-1, keepdim=True)[0]
+
+        x = F.relu(self.bn4(self.conv4(x)))
+        x4 = x.max(dim=-1, keepdim=True)[0]
+
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+
+        x = F.relu(self.bn5(self.conv5(x))).view(batch_size, -1, num_points)
+        '''
+        batch_size, num_points, num_dims = x.size()
+        x = x.permute(0,2,1)
+        batch_size = x.size(0)
+        x = get_graph_feature(x)
+        x = self.conv1(x)
+        x1 = x.max(dim=-1, keepdim=False)[0]
+
+        x = get_graph_feature(x1)
+        x = self.conv2(x)
+        x2 = x.max(dim=-1, keepdim=False)[0]
+
+        x = get_graph_feature(x2)
+        x = self.conv3(x)
+        x3 = x.max(dim=-1, keepdim=False)[0]
+
+        x = get_graph_feature(x3)
+        x = self.conv4(x)
+        x4 = x.max(dim=-1, keepdim=False)[0]
+
+        x = torch.cat((x1, x2, x3, x4), dim=1).unsqueeze(3)
+        x = F.relu(self.bn5(self.conv5(x))).view(batch_size, -1, num_points)
+        return x
 
 
 # a global function to flatten a feature
@@ -88,7 +193,7 @@ class PointNet(torch.nn.Module):
 
 # decoder network
 class Decoder(torch.nn.Module):
-    def __init__(self, num_points=2048, bottleneck_size=1024):
+    def __init__(self, num_points=2048, bottleneck_size=512):
         super(Decoder, self).__init__()
         self.num_points = num_points
         self.bottleneck_size = bottleneck_size
@@ -113,11 +218,13 @@ class Decoder(torch.nn.Module):
 
 # the neural network of feature-metric registration
 class SolveRegistration(torch.nn.Module):
-    def __init__(self, ptnet, decoder=None, isTest=False):
+    def __init__(self, ptnet, decoder=None, transformer=None , head = None ,isTest=False):
         super().__init__()
         # network
         self.encoder = ptnet
         self.decoder = decoder
+        self.transformer = transformer
+        self.head = head
 
         # functions
         self.inverse = invmat.InvMatrix.apply
@@ -219,9 +326,15 @@ class SolveRegistration(torch.nn.Module):
         # task 1
         loss_enco_deco = 0.0
         if not is_test:
-            decoder_out_f0 = self.decoder(f0)
-            decoder_out_f1 = self.decoder(f1)
+            f0_embedding, f1_embedding = self.transformer(f0,f1)
 
+            f0 = f0 + f0_embedding
+            f1 = f1 + f1_embedding  #
+            f1 = torch.squeeze(torch.max(f1, dim=2, keepdim=True)[0])
+            f0 = torch.squeeze(torch.max(f0, dim=2, keepdim=True)[0])
+            decoder_out_f0 = self.decoder(f0)
+
+            decoder_out_f1 = self.decoder(f1)
             p0_dist1, p0_dist2 = self.chamfer_loss(p0.contiguous(), decoder_out_f0)  # loss function
             loss_net0 = (torch.mean(p0_dist1)) + (torch.mean(p0_dist2))
             p1_dist1, p1_dist2 = self.chamfer_loss(p1.contiguous(), decoder_out_f1)  # loss function
@@ -232,6 +345,7 @@ class SolveRegistration(torch.nn.Module):
 
         # task 2
         f0 = self.encoder(p0)  # [B, N, 3] -> [B, K]
+        f0 = torch.squeeze(torch.max(f0, dim=2, keepdim=True)[0])
         # approx. J by finite difference
         dt = self.dt.to(p0).expand(batch_size, 6)  # convert to the type of p0. [B, 6]
         J = self.approx_Jac(p0, f0, dt)
@@ -247,15 +361,16 @@ class SolveRegistration(torch.nn.Module):
             self.last_err = err
             print(err)
             f1 = self.encoder(p1)  # [B, N, 3] -> [B, K]
+            f1 = torch.squeeze(torch.max(f1, dim=2, keepdim=True)[0])
             r = f1 - f0
             self.ptnet.train(training)
             return r, g, -1
-
         itr = 0
         r = None
         for itr in range(maxiter):
             p = self.transform(g.unsqueeze(1), p1)  # [B, 1, 4, 4] x [B, N, 3] -> [B, N, 3]
             f1 = self.encoder(p)  # [B, N, 3] -> [B, K]
+            f1 = torch.squeeze(torch.max(f1, dim=2, keepdim=True)[0])
             r = f1 - f0  # [B,K]
             dx = -pinv.bmm(r.unsqueeze(-1)).view(batch_size, 6)
 
@@ -292,6 +407,7 @@ class SolveRegistration(torch.nn.Module):
 
         f0 = f0.unsqueeze(-1)  # [B, K, 1]
         f1 = self.encoder(p.view(-1, num_points, 3))
+        f1 = torch.squeeze(torch.max(f1, dim=2, keepdim=True)[0])
         f = f1.view(batch_size, 6, -1).transpose(1, 2)  # [B, K, 6]
 
         df = f0 - f  # [B, K, 6]
@@ -344,13 +460,15 @@ class FMRTrain:
         self.max_iter = 10  # max iteration time for IC algorithm
         self._loss_type = train_type  # 0: unsupervised, 1: semi-supervised see. self.compute_loss()
 
-    def create_model(self):
+    def create_model(self,args):
         # Encoder network: extract feature for every point. Nx1024
-        ptnet = PointNet(dim_k=self.dim_k)
+        ptnet = DGCNN(emb_dims=self.dim_k)
         # Decoder network: decode the feature into points
-        decoder = Decoder(num_points=self.num_points)
+        decoder = Decoder(num_points=self.num_points,bottleneck_size=self.dim_k)
+        transformer = modelv2.Transformer(args=args)
+        head = modelv2.SVDHead(args=args)
         # feature-metric ergistration (fmr) algorithm: estimate the transformation T
-        fmr_solver = SolveRegistration(ptnet, decoder,isTest=False)
+        fmr_solver = SolveRegistration(ptnet, decoder,transformer,head,isTest=False)
         return fmr_solver
 
     def compute_loss(self, solver, data, device):
@@ -425,13 +543,15 @@ class FMRTest:
         self.max_iter = 10  # max iteration time for IC algorithm
         self._loss_type = 1  # see. self.compute_loss()
 
-    def create_model(self):
+    def create_model(self,args):
         # Encoder network: extract feature for every point. Nx1024
-        ptnet = PointNet(dim_k=self.dim_k)
+        ptnet = DGCNN(emb_dims=512)
         # Decoder network: decode the feature into points, not used during the evaluation
         decoder = Decoder()
+        decoder = Decoder()
+        transformer = modelv2.Transformer(args=args)
         # feature-metric ergistration (fmr) algorithm: estimate the transformation T
-        fmr_solver = SolveRegistration(ptnet, decoder, isTest=True)
+        fmr_solver = SolveRegistration(ptnet, decoder,transformer, isTest=True)
         return fmr_solver
 
     def evaluate(self, solver, testloader, device):

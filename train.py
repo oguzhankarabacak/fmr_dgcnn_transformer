@@ -29,15 +29,15 @@ def parameters(argv=None):
                         metavar='type', help='unsupervised (0) or semi-supervised (1) training (default: 0)')
 
     # settings for performance adjust
-    parser.add_argument('--dim-k', default=1024, type=int,
+    parser.add_argument('--dim-k', default=512, type=int,
                         metavar='K', help='dim. of the feature vector (default: 1024)')
-    parser.add_argument('--num-points', default=2048, type=int,
+    parser.add_argument('--num-points', default=256, type=int,
                         metavar='N', help='points in point-cloud (default: 1024)')
     parser.add_argument('--mag', default=0.8, type=float,
                         metavar='T', help='max. mag. of twist-vectors (perturbations) on training (default: 0.8)')
 
     # settings for on training
-    parser.add_argument('-b', '--batch-size', default=8, type=int,
+    parser.add_argument('-b', '--batch-size', default=2, type=int,
                         metavar='N', help='mini-batch size (default: 16)')
     parser.add_argument('--epochs', default=200, type=int,
                         metavar='N', help='number of total epochs to run')
@@ -53,7 +53,7 @@ def parameters(argv=None):
                         metavar='N', help='manual epoch number (useful on restarts)')
     parser.add_argument('--resume', default='', type=str,
                         metavar='PATH', help='path to latest checkpoint (default: null (no-use))')
-    parser.add_argument('--pretrained', default='./result/fmr_model_7scene.pth', type=str,
+    parser.add_argument('--pretrained', default='./result/fmr_model_modelnet40.pth', type=str,
                         metavar='PATH', help='path to pretrained model file (default: null (no-use))')
     parser.add_argument('--device', default='cuda:0', type=str,
                         metavar='DEVICE', help='use CUDA if available')
@@ -64,6 +64,20 @@ def parameters(argv=None):
                         help='path to the categories to be trained')  # eg. './sampledata/modelnet40_half1.txt'
     parser.add_argument('--mode', default='train', help='program mode. This code is for training')
     parser.add_argument('--uniformsampling', default=False, type=bool, help='uniform sampling points from the mesh')
+    ######################## Network Parameters ########################
+    parser.add_argument('--emb_dims', type=int, default=512, metavar='N',
+                        help='Dimension of embeddings')
+    parser.add_argument('--n_blocks', type=int, default=1, metavar='N',
+                        help='Num of blocks of encoder&decoder')
+    parser.add_argument('--n_heads', type=int, default=4, metavar='N',
+                        help='Num of heads in multiheadedattention')
+    parser.add_argument('--ff_dims', type=int, default=1024, metavar='N',
+                        help='Num of dimensions of fc in transformer')
+    parser.add_argument('--dropout', type=float, default=0.0, metavar='N',
+                        help='Dropout ratio in transformer')
+    ######################## Model Parameters ########################
+    parser.add_argument('--alpha_factor', type=float, default=4)
+    parser.add_argument('--eps', type=float, default=1e-12)
     args = parser.parse_args(argv)
     return args
 
@@ -82,10 +96,10 @@ def run(args, trainset, testset, action):
         args.device = 'cpu'
     args.device = torch.device(args.device)
 
-    model = action.create_model()
+    model = action.create_model(args)
     if args.store and os.path.isfile(args.store):
         model.load_state_dict(torch.load(args.store, map_location='cpu'))
-
+    args.pretrained = None
     if args.pretrained:
         assert os.path.isfile(args.pretrained)
         model.load_state_dict(torch.load(args.pretrained, map_location='cpu'))
